@@ -1,140 +1,94 @@
-const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
+// index.js
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessages
-  ]
+    GatewayIntentBits.GuildMessages,
+  ],
 });
 
-const TARGET_VC_ID = process.env.TARGET_VC_ID;
-const NOTIFY_CHANNEL_ID = process.env.NOTIFY_CHANNEL_ID;
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const TARGET_VC_ID = process.env.TARGET_VC_ID;       // 監視VC ID
+const NOTIFY_CHANNEL_ID = process.env.NOTIFY_CHANNEL_ID; // 通知先チャンネルID
 
+// VC滞在管理
 let vcStartTime = null;
-let interval = null;
-let messageId = null;
+let vcEmbedMessage = null;
+const vcUsersTime = new Map();    // key: userId, value: 累計秒数
+const userJoinTimes = new Map();  // key: userId, value: 入室タイムスタンプ
 
-function formatDuration(ms) {
-  const hours = Math.floor(ms / 3600000);
-  const minutes = Math.floor((ms % 3600000) / 60000);
-  return `${hours}時間${minutes}分`;
-}
+// VC状態更新イベント
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  const notifyChannel = await client.channels.fetch(NOTIFY_CHANNEL_ID);
+  const channelId = TARGET_VC_ID;
 
-async function startVC(vc, notifyChannel) {
-  if (interval) return; // 二重起動防止
+  // ===================
+  // 入室処理
+  // ===================
+  if (newState.channelId === channelId && oldState.channelId !== channelId) {
+    const now = Date.now();
 
-  vcStartTime = Date.now();
+    if (!vcStartTime) vcStartTime = now;
+    userJoinTimes.set(newState.id, now);
+    if (!vcUsersTime.has(newState.id)) vcUsersTime.set(newState.id, 0);
 
-  const embed = new EmbedBuilder()
-    .setTitle("🔔 VC開始")
-    .setColor(0x00AE86)
-    .addFields(
-      { name: "開始時間", value: `<t:${Math.floor(vcStartTime/1000)}:F>` },
-      { name: "参加人数", value: `${vc.members.size}人` },
-      { name: "経過時間", value: "0分" }
-    )
-    .setFooter({ text: "VC監視Bot" });
+    if (!vcEmbedMessage) {
+      const embed = new EmbedBuilder()
+        .setTitle('🔔 VC開始')
+        .setDescription(`開始時間: <t:${Math.floor(now/1000)}:F>\n参加者: 1`)
+        .setColor(0x00FF00);
 
-  const msg = await notifyChannel.send({ embeds: [embed] });
-  messageId = msg.id;
-
-  interval = setInterval(async () => {
-    try {
-      const diff = Date.now() - vcStartTime;
-
-      const updatedEmbed = new EmbedBuilder()
-        .setTitle("🔔 VC進行中")
-        .setColor(0x0099ff)
-        .addFields(
-          { name: "開始時間", value: `<t:${Math.floor(vcStartTime/1000)}:F>` },
-          { name: "参加人数", value: `${vc.members.size}人` },
-          { name: "経過時間", value: formatDuration(diff) }
-        );
-
-      const message = await notifyChannel.messages.fetch(messageId);
-      await message.edit({ embeds: [updatedEmbed] });
-
-    } catch (err) {
-      console.error("更新エラー:", err);
+      vcEmbedMessage = await notifyChannel.send({ embeds: [embed] });
     }
-  }, 30 * 60 * 1000);
-}
+  }
 
-async function stopVC(notifyChannel) {
-  if (!vcStartTime) return;
-
-  clearInterval(interval);
-  interval = null;
-
-  const diff = Date.now() - vcStartTime;
-
-  const embed = new EmbedBuilder()
-    .setTitle("✅ VC終了")
-    .setColor(0xff4444)
-    .addFields({
-      name: "総通話時間",
-      value: formatDuration(diff)
-    });
-
-  await notifyChannel.send({ embeds: [embed] });
-
-  vcStartTime = null;
-  messageId = null;
-}
-
-client.once("ready", async () => {
-  console.log(`ログイン完了: ${client.user.tag}`);
-
-  try {
-    const guild = client.guilds.cache.first();
-    const vc = guild.channels.cache.get(TARGET_VC_ID);
-    const notifyChannel = guild.channels.cache.get(NOTIFY_CHANNEL_ID);
-
-    // 🔥 再起動復旧
-    if (vc && vc.members.size > 0) {
-      console.log("再起動後にVCを検知、復旧します");
-      await startVC(vc, notifyChannel);
+  // ===================
+  // 退室処理
+  // ===================
+  if (oldState.channelId === channelId && newState.channelId !== channelId) {
+    const now = Date.now();
+    const joinTime = userJoinTimes.get(oldState.id);
+    if (joinTime) {
+      const durationSec = Math.floor((now - joinTime) / 1000);
+      vcUsersTime.set(oldState.id, vcUsersTime.get(oldState.id) + durationSec);
+      userJoinTimes.delete(oldState.id);
     }
 
-  } catch (err) {
-    console.error("起動時エラー:", err);
+    const vcChannel = oldState.guild.channels.cache.get(channelId);
+    if (vcChannel.members.size === 0 && vcEmbedMessage) {
+      const totalTime = Math.floor((now - vcStartTime) / 1000);
+
+      // 終了通知 Embed作成
+      let description = `総通話時間: ${Math.floor(totalTime / 60)}分\n\n`;
+      description += '参加者ごとの通話時間:\n';
+      for (const [userId, sec] of vcUsersTime) {
+        description += `<@${userId}>: ${Math.floor(sec / 60)}分\n`;
+      }
+
+      // 最後にメッセージを追加
+      description += `\n💡 お疲れさまでした！`;
+
+      const embed = new EmbedBuilder()
+        .setTitle('🏁 VC終了')
+        .setDescription(description)
+        .setColor(0xFF0000);
+
+      await notifyChannel.send({ embeds: [embed] });
+
+      // リセット
+      vcStartTime = null;
+      vcEmbedMessage = null;
+      vcUsersTime.clear();
+      userJoinTimes.clear();
+    }
   }
 });
 
-client.on("voiceStateUpdate", async (oldState, newState) => {
-  try {
-    const guild = newState.guild;
-    const vc = guild.channels.cache.get(TARGET_VC_ID);
-    const notifyChannel = guild.channels.cache.get(NOTIFY_CHANNEL_ID);
-    if (!vc) return;
-
-    // 誰かが入った
-    if (!oldState.channel && newState.channel?.id === TARGET_VC_ID) {
-      if (vc.members.size === 1) {
-        await startVC(vc, notifyChannel);
-      }
-    }
-
-    // 全員抜けたら終了
-    if (oldState.channel?.id === TARGET_VC_ID) {
-      if (vc.members.size === 0) {
-        await stopVC(notifyChannel);
-      }
-    }
-
-  } catch (err) {
-    console.error("イベントエラー:", err);
-  }
+// Bot起動
+client.once('ready', () => {
+  console.log(`${client.user.tag} が起動しました`);
 });
 
-// 🔥 突然死防止
-process.on("unhandledRejection", error => {
-  console.error("未処理Promise:", error);
-});
-
-process.on("uncaughtException", error => {
-  console.error("未処理例外:", error);
-});
-
-client.login(process.env.BOT_TOKEN);
+client.login(BOT_TOKEN);
